@@ -45,7 +45,11 @@ public final class AgentLoop implements HarnessAdapter {
     /** 同一步连续发起这么多回仍悬空，就不再自动重跑——多半是环境出了系统性问题，变成人的事。 */
     private static final int MAX_ATTEMPTS = 3;
 
-    /** 构造器注入——谁造的不关我事，我只管用。 */
+    /**
+     * 构造器注入——谁造的不关我事，我只管用。
+     * 契约：receipts 必须与工具网关（IdempotentToolWrapper）里的是同一个实例——
+     * 恢复裁决查的收据就是幂等层存的收据，各拿一个仓等于没有收据。
+     */
     public AgentLoop(TenantId tenant, ToolGateway tools, ModelGateway model, Journal journal, ReceiptStore receipts) {
         this.tenant = tenant;
         this.tools = tools;
@@ -141,7 +145,7 @@ public final class AgentLoop implements HarnessAdapter {
             Receipt receipt = receipts.find(new IdempotencyKey(tenant, runId, u.toolUseId())).orElse(null);
             if (receipt != null) {
                 journal.append(new JournalEvent.StepResolution(u.stepId(), u.toolUseId(),
-                        "replayed_from_receipt", receipt.content()));
+                        "replayed_from_receipt", "执行过、收据已落盘", receipt.content()));
                 journal.append(new JournalEvent.StepDone(u.stepId(), u.toolUseId(), receipt.content()));
                 messages.add(Msg.tool(u.toolUseId(), receipt.content()));
                 continue;
@@ -151,7 +155,7 @@ public final class AgentLoop implements HarnessAdapter {
                 throw new UncertainStepException(u, reasonOf(u));
             }
             String reason = reasonOf(u);
-            journal.append(new JournalEvent.StepResolution(u.stepId(), u.toolUseId(), "awaiting_human", reason));
+            journal.append(new JournalEvent.StepResolution(u.stepId(), u.toolUseId(), "awaiting_human", reason, null));
             throw new UncertainStepException(u, reason);
         }
     }
@@ -217,7 +221,8 @@ public final class AgentLoop implements HarnessAdapter {
             if (!resolved.contains(seq) && plannedBySeq.containsKey(seq)) {
                 JournalEvent.StepPlanned planned = plannedBySeq.get(seq);
                 uncertain.add(new Uncertain(new StepId(runId.value(), seq),
-                        planned.toolUseId(), planned.toolName(), planned.idempotent(), maxAttempt.get(seq)));
+                        planned.toolUseId(), planned.toolName(), planned.idempotent(),
+                        maxAttempt.get(seq), planned.inputDigest()));
             }
         }
         return uncertain;

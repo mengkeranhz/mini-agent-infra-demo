@@ -19,6 +19,10 @@ public final class IdempotentToolWrapper implements ToolGateway {
     /** 同键串行化的进程内锁：find→invoke→save 是 check-then-act，不加锁并发同键会双执行；跨进程要换 DB claim 行 + 等待协议。 */
     private final ConcurrentHashMap<IdempotencyKey, Object> locks = new ConcurrentHashMap<>();
 
+    /**
+     * 契约：这里的 receipts 必须与注入 AgentLoop 的是同一个实例（装配处保证）——
+     * 幂等层存下的收据要能被恢复裁决查到，两个仓就断了这条线。
+     */
     public IdempotentToolWrapper(ToolGateway inner, ReceiptStore receipts) {
         this.inner = inner;
         this.receipts = receipts;

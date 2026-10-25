@@ -11,6 +11,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -22,21 +23,27 @@ import org.platform.kernel.port.ReceiptStore;
 /**
  * 收据落盘实现：journal 的同一套纪律——一行一条、写后 force(true)、'\n' 是提交标志、重开截残行。
  * find() 全量扫文件（文件小，够用）；trySaveIfAbsent() 先扫判存在再写——这里同样是 check-then-act，
- * 进程内用同一把锁兜住，跨进程靠 DB 唯一键（UNIQUE(tenant, run, tool_call) + INSERT ON CONFLICT DO NOTHING）。
+ * 进程内按 Path intern 的锁互斥（多个实例写同一文件也只一把锁），跨进程靠 DB 唯一键
+ * （UNIQUE(tenant, run, tool_call) + INSERT ON CONFLICT DO NOTHING）。
  */
 public final class FileReceiptStore implements ReceiptStore {
+
+    /** 按 Path intern 的写锁：同一文件一个锁，不管进程里开了几个 store 实例。 */
+    private static final ConcurrentHashMap<Path, Object> PATH_LOCKS = new ConcurrentHashMap<>();
 
     private record Line(IdempotencyKey key, Receipt receipt) {
     }
 
     private final Path file;
+    private final Object writeLock;
     private final ObjectMapper mapper = new ObjectMapper();
     private final FileChannel channel;
 
     public FileReceiptStore(Path file) throws IOException {
         this.file = file;
+        this.writeLock = PATH_LOCKS.computeIfAbsent(file.toAbsolutePath().normalize(), p -> new Object());
         Files.createDirectories(file.getParent());
-        FileJournal.discardBrokenTail(file);
+        TailSafeJsonl.discardBrokenTail(file);
         this.channel = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 
@@ -47,7 +54,7 @@ public final class FileReceiptStore implements ReceiptStore {
 
     @Override
     public boolean trySaveIfAbsent(IdempotencyKey key, Receipt receipt) {
-        synchronized (this) {
+        synchronized (writeLock) {
             if (find(key).isPresent()) {
                 return false;
             }

@@ -53,8 +53,12 @@ public sealed interface JournalEvent
         }
     }
 
-    /** 裁决段：恢复时对悬空步的判定结论——判定本身必须落盘，否则挂起状态重启后不可见、永远收敛不了。 */
-    record StepResolution(StepId stepId, String toolUseId, String resolution, String detail)
+    /**
+     * 裁决段：恢复时对悬空步的判定结论——判定本身必须落盘，否则挂起状态重启后不可见、永远收敛不了。
+     * reason 是为什么这么裁（无收据 / 重试到上限 / 收据找回）；result 是裁出来的结果
+     * （replayed_from_receipt 时为收据内容，awaiting_human 时为 null——还没有结果）。
+     */
+    record StepResolution(StepId stepId, String toolUseId, String resolution, String reason, String result)
             implements JournalEvent {
 
         @Override

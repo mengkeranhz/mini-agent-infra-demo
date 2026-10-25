@@ -41,7 +41,7 @@ public final class FileJournal implements Journal {
     public FileJournal(Path file) throws IOException {
         this.file = file;
         Files.createDirectories(file.getParent());
-        discardBrokenTail(file);
+        TailSafeJsonl.discardBrokenTail(file);
         this.nextSeq = countLines();
         this.channel = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
@@ -92,21 +92,6 @@ public final class FileJournal implements Journal {
         };
     }
 
-    /** 截掉不以 '\n' 结尾的尾部残行——哪怕残行恰好是合法 JSON，没等到换行就是没提交。收据文件同一套纪律，包内复用。 */
-    static void discardBrokenTail(Path file) throws IOException {
-        if (!Files.exists(file)) {
-            return;
-        }
-        byte[] all = Files.readAllBytes(file);
-        int lastNl = lastIndexOf(all, (byte) '\n');
-        if (all.length == 0 || lastNl == all.length - 1) {
-            return;
-        }
-        try (FileChannel ch = FileChannel.open(file, StandardOpenOption.WRITE)) {
-            ch.truncate(lastNl < 0 ? 0 : lastNl + 1);
-        }
-    }
-
     private long countLines() throws IOException {
         if (!Files.exists(file)) {
             return 0;
@@ -114,12 +99,4 @@ public final class FileJournal implements Journal {
         return Files.readAllLines(file, StandardCharsets.UTF_8).stream().filter(l -> !l.isBlank()).count();
     }
 
-    static int lastIndexOf(byte[] bytes, byte target) {
-        for (int i = bytes.length - 1; i >= 0; i--) {
-            if (bytes[i] == target) {
-                return i;
-            }
-        }
-        return -1;
-    }
 }

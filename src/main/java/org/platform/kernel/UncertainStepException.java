@@ -7,11 +7,11 @@ public final class UncertainStepException extends RuntimeException {
 
     public UncertainStepException(Uncertain step, String reason) {
         super("悬空步 " + step.stepId().runId() + "#" + step.stepId().seq() + " " + step.toolUseId() + " ("
-                + step.toolName() + ")：" + reason + "，等待人工介入");
+                + step.toolName() + " " + step.inputDigest().substring(0, 19) + "...)：" + reason + "，等待人工介入");
         this.step = step;
     }
 
-    /** 卡住的那一步——人工介入的作业对象。 */
+    /** 卡住的那一步（含 inputDigest，人工裁决看「到底发了什么」）。 */
     public Uncertain step() {
         return step;
     }

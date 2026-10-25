@@ -51,7 +51,8 @@ public class Main {
             case JournalEvent.StepDone ev -> key(ev.stepId()) + " StepDone: " + ev.toolUseId() + " -> " + ev.content();
             case JournalEvent.StepFailed ev -> key(ev.stepId()) + " StepFailed: " + ev.toolUseId() + " ! " + ev.error();
             case JournalEvent.StepResolution ev -> key(ev.stepId()) + " StepResolution: " + ev.toolUseId()
-                    + " " + ev.resolution() + " (" + ev.detail() + ")";
+                    + " " + ev.resolution() + " reason=" + ev.reason()
+                    + (ev.result() != null ? " result=" + ev.result() : "");
             case JournalEvent.RunFinished ev -> ev.runId().value() + " RunFinished: " + ev.answer();
         };
     }
