@@ -173,6 +173,17 @@ class M1Test {
                 .map(JournalEvent.StepDone.class::cast)
                 .filter(e -> "t-2".equals(e.toolUseId()))
                 .toList()).hasSize(1);
+        assertThat(events.stream()
+                .filter(JournalEvent.StepDone.class::isInstance)
+                .map(JournalEvent.StepDone.class::cast)
+                .filter(e -> "t-2".equals(e.toolUseId()))
+                .findFirst().orElseThrow().source())
+                .isEqualTo("replayed_from_receipt");
+        assertThat(events.stream()
+                .filter(JournalEvent.StepResolution.class::isInstance)
+                .map(JournalEvent.StepResolution.class::cast)
+                .map(JournalEvent.StepResolution::resolution)
+                .toList()).doesNotContain("replayed_from_receipt");
         assertThat(events.stream().filter(JournalEvent.StepDispatched.class::isInstance).toList()).hasSize(2);
         assertThat(events.stream().filter(JournalEvent.RunFinished.class::isInstance)).hasSize(1);
     }

@@ -114,7 +114,8 @@ public final class AgentLoop implements HarnessAdapter {
         if (result.isError()) {
             journal.append(new JournalEvent.StepFailed(stepId, call.id(), result.content()));
         } else {
-            journal.append(new JournalEvent.StepDone(stepId, result.toolUseId(), result.content()));
+            journal.append(new JournalEvent.StepDone(stepId, result.toolUseId(), result.content(),
+                    JournalEvent.SOURCE_EXECUTED));
         }
         messages.add(Msg.tool(result.toolUseId(), result.content()));
         return stepId.next();
@@ -144,9 +145,8 @@ public final class AgentLoop implements HarnessAdapter {
             }
             Receipt receipt = receipts.find(new IdempotencyKey(tenant, runId, u.toolUseId())).orElse(null);
             if (receipt != null) {
-                journal.append(new JournalEvent.StepResolution(u.stepId(), u.toolUseId(),
-                        "replayed_from_receipt", "执行过、收据已落盘", receipt.content()));
-                journal.append(new JournalEvent.StepDone(u.stepId(), u.toolUseId(), receipt.content()));
+                journal.append(new JournalEvent.StepDone(u.stepId(), u.toolUseId(), receipt.content(),
+                        JournalEvent.SOURCE_REPLAYED_FROM_RECEIPT));
                 messages.add(Msg.tool(u.toolUseId(), receipt.content()));
                 continue;
             }

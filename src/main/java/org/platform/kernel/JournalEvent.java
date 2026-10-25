@@ -16,6 +16,10 @@ public sealed interface JournalEvent
     /** 事件归属的 run——重放按它过滤。 */
     RunId runId();
 
+    /** StepDone.source 的取值：真执行 / 崩溃后从收据回放补的。 */
+    String SOURCE_EXECUTED = "executed";
+    String SOURCE_REPLAYED_FROM_RECEIPT = "replayed_from_receipt";
+
     record RunStarted(RunId runId, String task) implements JournalEvent {
     }
 
@@ -37,7 +41,8 @@ public sealed interface JournalEvent
         }
     }
 
-    record StepDone(StepId stepId, String toolUseId, String content) implements JournalEvent {
+    /** 完成段：一次调用有了确定结果。source 记结果从哪来——executed / replayed_from_receipt。 */
+    record StepDone(StepId stepId, String toolUseId, String content, String source) implements JournalEvent {
 
         @Override
         public RunId runId() {
@@ -55,8 +60,8 @@ public sealed interface JournalEvent
 
     /**
      * 裁决段：恢复时对悬空步的判定结论——判定本身必须落盘，否则挂起状态重启后不可见、永远收敛不了。
-     * reason 是为什么这么裁（无收据 / 重试到上限 / 收据找回）；result 是裁出来的结果
-     * （replayed_from_receipt 时为收据内容，awaiting_human 时为 null——还没有结果）。
+     * 只用于 awaiting_human：回放收据的判定已并入 StepDone.source = replayed_from_receipt；
+     * reason 记为什么挂起，result 预留人工裁决后的回填。
      */
     record StepResolution(StepId stepId, String toolUseId, String resolution, String reason, String result)
             implements JournalEvent {

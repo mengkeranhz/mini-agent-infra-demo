@@ -50,7 +50,8 @@ public class Main {
                     + (ev.idempotent() ? " [幂等]" : " [非幂等]") + " " + ev.inputDigest() + " " + ev.toolUseId();
             case JournalEvent.StepDispatched ev -> key(ev.stepId()) + " StepDispatched: " + ev.toolUseId()
                     + " attempt=" + ev.attempt();
-            case JournalEvent.StepDone ev -> key(ev.stepId()) + " StepDone: " + ev.toolUseId() + " -> " + ev.content();
+            case JournalEvent.StepDone ev -> key(ev.stepId()) + " StepDone: " + ev.toolUseId() + " -> " + ev.content()
+                    + (!JournalEvent.SOURCE_EXECUTED.equals(ev.source()) ? " [" + ev.source() + "]" : "");
             case JournalEvent.StepFailed ev -> key(ev.stepId()) + " StepFailed: " + ev.toolUseId() + " ! " + ev.error();
             case JournalEvent.StepResolution ev -> key(ev.stepId()) + " StepResolution: " + ev.toolUseId()
                     + " " + ev.resolution() + " reason=" + ev.reason()
