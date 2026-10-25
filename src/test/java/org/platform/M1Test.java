@@ -53,7 +53,8 @@ class M1Test {
         Path receiptsFile = dataFile("crash-receipts.jsonl");
         TenantId tenant = TenantId.DEFAULT;
         RunId runId = RunId.generate();
-        CountingSend send = new CountingSend();
+        FakeMailbox mailbox = new FakeMailbox();
+        CountingSend send = new CountingSend(mailbox);
 
         // 闸门放在 Dispatched 之后、真发一次再崩：副作用已发生，收据与 StepDone 均未落盘（最难窗口）
         ReceiptStore store1 = new FileReceiptStore(receiptsFile);
@@ -101,6 +102,7 @@ class M1Test {
 
         assertThat(answer).isEqualTo("消息已发出，run 结束。");
         assertThat(send.count.get()).isEqualTo(1);
+        assertThat(mailbox.deliveredCount()).isEqualTo(1);
         List<JournalEvent> events = new FileJournal(journalFile).scan();
         assertThat(events.stream().filter(JournalEvent.RunStarted.class::isInstance)).hasSize(1);
         assertThat(events.stream().filter(JournalEvent.RunFinished.class::isInstance)).hasSize(1);
@@ -131,7 +133,8 @@ class M1Test {
         // —— 对照组：收据只在内存，重启即失 → 悬空步无收据，只能挂起等人工 ——
         Path memJournal = dataFile("w4-mem.jsonl");
         RunId memRun = RunId.generate();
-        CountingSend memSend = new CountingSend();
+        FakeMailbox memMailbox = new FakeMailbox();
+        CountingSend memSend = new CountingSend(memMailbox);
         ToolGateway memWrapper = new IdempotentToolWrapper(
                 new ToolRouter(new WebSearchTool(), memSend), new MemoryReceiptStore());
         assertThatThrownBy(() -> new AgentLoop(tenant, new CrashAfterReceiptSaved(memWrapper),
@@ -150,7 +153,8 @@ class M1Test {
         Path fileJournal = dataFile("w4-file.jsonl");
         Path fileReceipts = dataFile("w4-file-receipts.jsonl");
         RunId fileRun = RunId.generate();
-        CountingSend fileSend = new CountingSend();
+        FakeMailbox fileMailbox = new FakeMailbox();
+        CountingSend fileSend = new CountingSend(fileMailbox);
         ReceiptStore store1 = new FileReceiptStore(fileReceipts);
         ToolGateway fileWrapper = new IdempotentToolWrapper(
                 new ToolRouter(new WebSearchTool(), fileSend), store1);
@@ -167,6 +171,7 @@ class M1Test {
 
         assertThat(answer).isEqualTo("消息已发出，run 结束。");
         assertThat(fileSend.count.get()).isEqualTo(1);
+        assertThat(fileMailbox.deliveredCount()).isEqualTo(1);
         List<JournalEvent> events = new FileJournal(fileJournal).scan();
         assertThat(events.stream()
                 .filter(JournalEvent.StepDone.class::isInstance)
@@ -190,13 +195,14 @@ class M1Test {
 
     @Test
     void 并发同键只执行一次() throws Exception {
-        CountingSend send = new CountingSend();
+        FakeMailbox mailbox = new FakeMailbox();
+        CountingSend send = new CountingSend(mailbox);
         ToolGateway tools = new IdempotentToolWrapper(new ToolRouter(send), new MemoryReceiptStore());
         TenantId tenant = TenantId.DEFAULT;
         RunId runId = RunId.generate();
         StepCtx ctx = new StepCtx(tenant, runId, StepId.first(runId));
         ToolUse call = new ToolUse("t-7", "send_message", """
-                {"msg":"race"}""");
+                {"to":"qa","campaign":"race","seq":1,"msg":"race"}""");
 
         ExecutorService pool = Executors.newFixedThreadPool(2);
         try {
@@ -205,6 +211,7 @@ class M1Test {
             ToolResult ra = a.get();
             ToolResult rb = b.get();
             assertThat(send.count.get()).isEqualTo(1);
+            assertThat(mailbox.deliveredCount()).isEqualTo(1);
             assertThat(rb.content()).isEqualTo(ra.content());
             assertThat(rb.isError()).isEqualTo(ra.isError());
         } finally {
@@ -254,25 +261,40 @@ class M1Test {
 
     @Test
     void 外层幂等键_下游自己去重_不依赖平台幂等层() {
+        // 注册期把关：有副作用又不认外层键的工具，根本进不了工具表
+        assertThatThrownBy(() -> new ToolRouter(new WebSearchTool(), new NoKeySendTool()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("拒绝注册");
+
         // 刻意不走 IdempotentToolWrapper：平台幂等层等于不存在，只考验下游自己认不认得出重复
         FakeMailbox mailbox = new FakeMailbox();
         ToolGateway router = new ToolRouter(new WebSearchTool(), new SendMessageTool(mailbox));
         TenantId tenant = TenantId.DEFAULT;
         RunId runId = RunId.generate();
         StepCtx ctx = new StepCtx(tenant, runId, StepId.first(runId));
-        ToolUse call = new ToolUse("t-9", "send_message", """
-                {"msg":"下游自己去重"}""");
 
-        ToolResult first = router.invoke(ctx, call);
-        ToolResult second = router.invoke(ctx, call);
+        // 同一业务键（to/campaign/seq 全同）的重试：返回首次的真实结果，不二次投递
+        ToolResult first = router.invoke(ctx, new ToolUse("t-9", "send_message", """
+                {"to":"zhangsan","campaign":"daily","seq":1,"msg":"OK"}"""));
+        ToolResult retry = router.invoke(ctx, new ToolUse("t-9", "send_message", """
+                {"to":"zhangsan","campaign":"daily","seq":1,"msg":"OK"}"""));
+        assertThat(retry.content()).isEqualTo(first.content());
+        assertThat(retry.isError()).isEqualTo(first.isError());
+        assertThat(mailbox.deliveredCount()).isEqualTo(1);
 
-        assertThat(first.content()).isEqualTo("ok");
-        assertThat(second.content()).isEqualTo("DUPLICATE-IGNORED");
-        Optional<ExternalIdempotencyKey> key = new SendMessageTool(mailbox).externalKey(call);
+        // 内容一模一样、业务键不同（seq=2）：两次合法操作，都得投
+        ToolResult second = router.invoke(ctx, new ToolUse("t-9", "send_message", """
+                {"to":"zhangsan","campaign":"daily","seq":2,"msg":"OK"}"""));
+        assertThat(second.content()).isEqualTo("ok");
+        assertThat(mailbox.deliveredCount()).isEqualTo(2);
+
+        // 键的形状：businessKey 由参数派生，不是内容摘要
+        Optional<ExternalIdempotencyKey> key = new SendMessageTool(mailbox).externalKey(new ToolUse("t-9", "send_message", """
+                {"to":"zhangsan","campaign":"daily","seq":1,"msg":"OK"}"""));
         assertThat(key).isPresent();
         assertThat(key.orElseThrow().system()).isEqualTo("stdout");
         assertThat(key.orElseThrow().operation()).isEqualTo("print");
-        assertThat(key.orElseThrow().businessKey()).startsWith("sha256:");
+        assertThat(key.orElseThrow().businessKey()).isEqualTo("zhangsan/daily/1");
     }
 
     private static String runOnce(TenantId tenant, Path journalFile, Tool web, RunId runId) throws IOException {
@@ -294,7 +316,11 @@ class M1Test {
     static final class CountingSend implements Tool {
 
         final AtomicInteger count = new AtomicInteger();
-        private final SendMessageTool delegate = new SendMessageTool(new FakeMailbox());
+        private final SendMessageTool delegate;
+
+        CountingSend(FakeMailbox mailbox) {
+            this.delegate = new SendMessageTool(mailbox);
+        }
 
         @Override
         public String name() {
@@ -304,6 +330,11 @@ class M1Test {
         @Override
         public boolean idempotent() {
             return false;
+        }
+
+        @Override
+        public boolean providesExternalKey() {
+            return true;
         }
 
         @Override
@@ -334,6 +365,11 @@ class M1Test {
         }
 
         @Override
+        public boolean providesExternalKey() {
+            return true;
+        }
+
+        @Override
         public ToolResult invoke(ToolUse use) {
             ToolResult result = delegate.invoke(use);
             if (armed) {
@@ -341,6 +377,25 @@ class M1Test {
                 throw new RuntimeException("模拟崩溃: 已发出，收据与 StepDone 均未落盘");
             }
             return result;
+        }
+    }
+
+    /** 有副作用却不认外层键的反例工具——注册期就该被拒。 */
+    static final class NoKeySendTool implements Tool {
+
+        @Override
+        public String name() {
+            return "send_message";
+        }
+
+        @Override
+        public boolean idempotent() {
+            return false;
+        }
+
+        @Override
+        public ToolResult invoke(ToolUse use) {
+            return new ToolResult(use.id(), "不应被注册，更不应被调用", true);
         }
     }
 

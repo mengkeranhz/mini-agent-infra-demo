@@ -5,7 +5,9 @@ import java.util.Objects;
 /**
  * 外层幂等键：跨系统的幂等凭证。平台内那层（IdempotencyKey）只保平台自己不重发；
  * 这层让下游系统自己认出「这单我见过」——平台崩了、换了实现，下游还站得住。
- * system = 下游系统名；operation = 操作名；businessKey = 业务去重键（通常是对内容的摘要）。
+ * system = 下游系统名；operation = 操作名；
+ * businessKey = 业务去重键，由调用方在参数里给出或由工具从参数派生（如 收件人/活动/序号）——
+ * 内容摘要不是业务键：同一内容给同一人连发两条，可以是两次合法操作。
  */
 public record ExternalIdempotencyKey(String system, String operation, String businessKey) {
 

@@ -28,7 +28,7 @@ public final class StubModelGateway implements ModelGateway {
             return new ModelResponse(
                     "搜到结果了，发条消息收尾。",
                     List.of(new ToolUse(SEND_CALL, "send_message", """
-                            {"msg":"hello kernel"}""")));
+                            {"to":"ops","campaign":"m1-demo","seq":1,"msg":"hello kernel"}""")));
         }
         return ModelResponse.of("消息已发出，run 结束。");
     }

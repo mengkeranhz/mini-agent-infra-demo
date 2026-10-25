@@ -8,13 +8,21 @@ import org.platform.demo.ToolUse;
 import org.platform.kernel.id.StepCtx;
 import org.platform.kernel.port.ToolGateway;
 
-/** 工具网关实现：按名字路由到注入的工具表，未知工具只报错、不炸循环。 */
+/**
+ * 工具网关实现：按名字路由到注入的工具表，未知工具只报错、不炸循环。
+ * 兼任注册期把关：有副作用（非幂等）的工具必须声明提供外层幂等键，否则拒绝注册——
+ * M2 的 ToolRegistry 会接管这道闸，现在闸位就在这。
+ */
 public final class ToolRouter implements ToolGateway {
 
     private final Map<String, Tool> tools = new HashMap<>();
 
     public ToolRouter(Tool... tools) {
         for (Tool tool : tools) {
+            if (!tool.idempotent() && !tool.providesExternalKey()) {
+                throw new IllegalArgumentException("拒绝注册 " + tool.name()
+                        + "：非幂等工具必须提供外层幂等键——副作用工具不认键，下游裸奔");
+            }
             this.tools.put(tool.name(), tool);
         }
     }
