@@ -8,6 +8,7 @@ import org.platform.demo.FileJournal;
 import org.platform.demo.FileReceiptStore;
 import org.platform.demo.IdempotentToolWrapper;
 import org.platform.demo.StubModelGateway;
+import org.platform.demo.tools.FakeMailbox;
 import org.platform.demo.tools.SendMessageTool;
 import org.platform.demo.tools.ToolRouter;
 import org.platform.demo.tools.WebSearchTool;
@@ -30,7 +31,8 @@ public class Main {
         System.out.println("runId = " + runId.value());
         ModelGateway model = new StubModelGateway();
         ReceiptStore receipts = new FileReceiptStore(Path.of("target", "receipts.jsonl"));
-        ToolGateway tools = new IdempotentToolWrapper(new ToolRouter(new WebSearchTool(), new SendMessageTool()), receipts);
+        ToolGateway tools = new IdempotentToolWrapper(
+                new ToolRouter(new WebSearchTool(), new SendMessageTool(new FakeMailbox())), receipts);
         Journal journal = new FileJournal(Path.of("target", "journal.jsonl"));
         HarnessAdapter harness = new AgentLoop(tenant, tools, model, journal, receipts);
         String answer = harness.run(runId, "跑通幂等 + 非幂等两个工具");

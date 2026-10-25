@@ -10,6 +10,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
 import org.platform.demo.AgentLoop;
@@ -21,9 +22,11 @@ import org.platform.demo.StubModelGateway;
 import org.platform.demo.ToolResult;
 import org.platform.demo.ToolUse;
 import org.platform.demo.tools.SendMessageTool;
+import org.platform.demo.tools.FakeMailbox;
 import org.platform.demo.tools.Tool;
 import org.platform.demo.tools.ToolRouter;
 import org.platform.demo.tools.WebSearchTool;
+import org.platform.kernel.ExternalIdempotencyKey;
 import org.platform.kernel.JournalEvent;
 import org.platform.kernel.Receipt;
 import org.platform.kernel.id.IdempotencyKey;
@@ -238,6 +241,29 @@ class M1Test {
                 .toList()).hasSize(1);
     }
 
+    @Test
+    void 外层幂等键_下游自己去重_不依赖平台幂等层() {
+        // 刻意不走 IdempotentToolWrapper：平台幂等层等于不存在，只考验下游自己认不认得出重复
+        FakeMailbox mailbox = new FakeMailbox();
+        ToolGateway router = new ToolRouter(new WebSearchTool(), new SendMessageTool(mailbox));
+        TenantId tenant = TenantId.DEFAULT;
+        RunId runId = RunId.generate();
+        StepCtx ctx = new StepCtx(tenant, runId, StepId.first(runId));
+        ToolUse call = new ToolUse("t-9", "send_message", """
+                {"msg":"下游自己去重"}""");
+
+        ToolResult first = router.invoke(ctx, call);
+        ToolResult second = router.invoke(ctx, call);
+
+        assertThat(first.content()).isEqualTo("ok");
+        assertThat(second.content()).isEqualTo("DUPLICATE-IGNORED");
+        Optional<ExternalIdempotencyKey> key = new SendMessageTool(mailbox).externalKey(call);
+        assertThat(key).isPresent();
+        assertThat(key.orElseThrow().system()).isEqualTo("stdout");
+        assertThat(key.orElseThrow().operation()).isEqualTo("print");
+        assertThat(key.orElseThrow().businessKey()).startsWith("sha256:");
+    }
+
     private static String runOnce(TenantId tenant, Path journalFile, Tool web, RunId runId) throws IOException {
         return new AgentLoop(tenant,
                 new IdempotentToolWrapper(new ToolRouter(web), new MemoryReceiptStore()),
@@ -257,7 +283,7 @@ class M1Test {
     static final class CountingSend implements Tool {
 
         final AtomicInteger count = new AtomicInteger();
-        private final SendMessageTool delegate = new SendMessageTool();
+        private final SendMessageTool delegate = new SendMessageTool(new FakeMailbox());
 
         @Override
         public String name() {
