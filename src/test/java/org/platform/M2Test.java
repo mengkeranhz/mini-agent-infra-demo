@@ -220,6 +220,12 @@ class M2Test {
         assertThat(acmeRegistry.forTenant(eve).find("send_message")).isEmpty();
         assertThat(acmeRegistry.forTenant(eve).find("web_search")).isEmpty();
         assertThat(acmeRegistry.forTenant(ACME).find("send_message")).isPresent();
+        // 查询口子同一口径：idempotent 也走租户视图——别家工具与「不存在」同音（都 false）
+        assertThat(tools.idempotent(eve, "send_message")).isFalse();
+        assertThat(tools.idempotent(eve, "web_search")).isFalse();
+        assertThat(tools.idempotent(ACME, "web_search")).isTrue();
+        assertThat(tools.idempotent(ACME, "send_message")).isFalse();   // 本租户看得见，但工具本身非幂等
+        assertThat(tools.idempotent(ACME, "no_such")).isFalse();
         assertThat(mailbox.deliveredCount()).isZero();
         assertThat(audit.events()).extracting(AuditLog.Event::outcome)
                 .containsExactly("unknown_tool", "unknown_tool");

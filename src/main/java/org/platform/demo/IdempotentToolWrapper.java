@@ -1,10 +1,9 @@
 package org.platform.demo;
 
-import java.util.concurrent.ConcurrentHashMap;
-
 import org.platform.kernel.Receipt;
 import org.platform.kernel.id.IdempotencyKey;
 import org.platform.kernel.id.StepCtx;
+import org.platform.kernel.id.TenantId;
 import org.platform.kernel.port.ReceiptStore;
 import org.platform.kernel.port.ToolGateway;
 
@@ -17,7 +16,7 @@ public final class IdempotentToolWrapper implements ToolGateway {
     private final ToolGateway inner;
     private final ReceiptStore receipts;
     /** 同键串行化的进程内锁：find→invoke→save 是 check-then-act，不加锁并发同键会双执行；跨进程要换 DB claim 行 + 等待协议。 */
-    private final ConcurrentHashMap<IdempotencyKey, Object> locks = new ConcurrentHashMap<>();
+    private final KeyedLock locks = new KeyedLock();
 
     /**
      * 契约：这里的 receipts 必须与注入 AgentLoop 的是同一个实例（装配处保证）——
@@ -32,7 +31,7 @@ public final class IdempotentToolWrapper implements ToolGateway {
     @Override
     public ToolResult invoke(StepCtx ctx, ToolUse call) {
         IdempotencyKey key = new IdempotencyKey(ctx.tenantId(), ctx.runId(), call.id());
-        synchronized (locks.computeIfAbsent(key, k -> new Object())) {
+        synchronized (locks.lockFor(key)) {
             Receipt hit = receipts.find(key).orElse(null);
             if (hit != null) {
                 return replayHit(call.id(), hit);
@@ -61,7 +60,7 @@ public final class IdempotentToolWrapper implements ToolGateway {
     }
 
     @Override
-    public boolean idempotent(String toolName) {
-        return inner.idempotent(toolName);
+    public boolean idempotent(TenantId tenant, String toolName) {
+        return inner.idempotent(tenant, toolName);
     }
 }

@@ -4,12 +4,12 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import org.platform.demo.KeyedLock;
 import org.platform.demo.ToolResult;
 import org.platform.demo.ToolUse;
 import org.platform.kernel.ApprovalRecord;
@@ -17,6 +17,7 @@ import org.platform.kernel.ApprovalRequiredException;
 import org.platform.kernel.Receipt;
 import org.platform.kernel.id.IdempotencyKey;
 import org.platform.kernel.id.StepCtx;
+import org.platform.kernel.id.TenantId;
 import org.platform.kernel.port.ApprovalStore;
 import org.platform.kernel.port.ArtifactStore;
 import org.platform.kernel.port.AuditLog;
@@ -62,8 +63,9 @@ public final class GatedToolGateway implements ToolGateway {
     private final AuditLog audit;
     private final int maxResultBytes;
     private final ObjectMapper json = new ObjectMapper();
-    /** 同键串行化（第 7 步）：find→execute→save 是 check-then-act，不加锁并发同键会双执行；跨进程要换 DB claim 行。 */
-    private final ConcurrentHashMap<IdempotencyKey, Object> locks = new ConcurrentHashMap<>();
+    /** 同键串行化（第 7 步）：find→execute→save 是 check-then-act，不加锁并发同键会双执行；跨进程要换 DB claim 行。
+     *  分段锁——同键互斥即可，不必每键一把（锁表不随调用数增长），见 KeyedLock。 */
+    private final KeyedLock locks = new KeyedLock();
 
     public GatedToolGateway(ToolRegistry registry, Principal caller, PolicyEngine policy,
                             ApprovalStore approvals, ReceiptStore receipts, ArtifactStore artifacts,
@@ -107,6 +109,8 @@ public final class GatedToolGateway implements ToolGateway {
             return audited(ctx, call, reg, "schema_rejected", schemaError);
         }
         // 5 策略裁决
+        // 已知取舍：回放重走第 5/6 步（重放不是免检通道）。代价是批条过期后已有收据的调用
+        // 回放不出来，run 会卡死。M3 在 StepPlanned/StepDispatched 里冻结 Decision 与 approvalRef 解决。
         Decision decision = policy.decide(caller, call.name(), call.input());
         if (decision == Decision.DENY) {
             return audited(ctx, call, reg, "policy_denied", "策略拒绝: " + call.name());
@@ -124,7 +128,7 @@ public final class GatedToolGateway implements ToolGateway {
         }
         // 第 7 步起进入同键临界区：find → execute → save 必须串行，否则并发同键双执行
         IdempotencyKey key = new IdempotencyKey(ctx.tenantId(), ctx.runId(), call.id());
-        synchronized (locks.computeIfAbsent(key, k -> new Object())) {
+        synchronized (locks.lockFor(key)) {
             // 7 幂等检查：收据在，不执行，原样回放
             Receipt hit = receipts.find(key).orElse(null);
             if (hit != null) {
@@ -152,8 +156,8 @@ public final class GatedToolGateway implements ToolGateway {
     }
 
     @Override
-    public boolean idempotent(String toolName) {
-        return registry.idempotent(toolName);
+    public boolean idempotent(TenantId tenant, String toolName) {
+        return registry.idempotent(tenant, toolName);
     }
 
     /** 拒绝类出口：错误结果回轨迹 + 审计留痕（第 11/12 步）。 */

@@ -27,13 +27,14 @@ import org.platform.kernel.port.ReceiptStore;
  * 隔离同样落在布局上：一个 tenant 一个文件 baseDir/&lt;tenant&gt;/receipts.jsonl，
  * find/trySave 只碰键里那个租户的文件——别家的收据行连读都不读，正文不见面、元数据也不见面。
  * trySaveIfAbsent() 先扫判存在再写——这里同样是 check-then-act，
- * 进程内按 Path intern 的锁互斥（多个实例写同一文件也只一把锁），跨进程靠 DB 唯一键
+ * 进程内按 Path 分段锁互斥（多个实例写同一文件也只一把锁），跨进程靠 DB 唯一键
  * （UNIQUE(tenant, run, tool_call) + INSERT ON CONFLICT DO NOTHING）。
  */
 public final class FileReceiptStore implements ReceiptStore {
 
-    /** 按 Path intern 的写锁：同一文件一个锁，不管进程里开了几个 store 实例。 */
-    private static final ConcurrentHashMap<Path, Object> PATH_LOCKS = new ConcurrentHashMap<>();
+    /** 按 Path 取段的写锁：同一文件永远同一把，不同文件可能共享一把（只多等一会儿，不影响正确性）；
+     *  静态——进程里开几个 store 实例都共享这批锁，见 KeyedLock。 */
+    private static final KeyedLock PATH_LOCKS = new KeyedLock();
 
     private record Line(IdempotencyKey key, Receipt receipt) {
     }
@@ -58,7 +59,7 @@ public final class FileReceiptStore implements ReceiptStore {
     @Override
     public boolean trySaveIfAbsent(IdempotencyKey key, Receipt receipt) {
         Path file = fileOf(key.tenantId());
-        synchronized (PATH_LOCKS.computeIfAbsent(file.toAbsolutePath().normalize(), p -> new Object())) {
+        synchronized (PATH_LOCKS.lockFor(file.toAbsolutePath().normalize())) {
             if (find(key).isPresent()) {
                 return false;
             }

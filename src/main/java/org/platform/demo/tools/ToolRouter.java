@@ -6,6 +6,7 @@ import java.util.Map;
 import org.platform.demo.ToolResult;
 import org.platform.demo.ToolUse;
 import org.platform.kernel.id.StepCtx;
+import org.platform.kernel.id.TenantId;
 import org.platform.kernel.port.ToolGateway;
 
 /**
@@ -37,7 +38,8 @@ public final class ToolRouter implements ToolGateway {
     }
 
     @Override
-    public boolean idempotent(String toolName) {
+    public boolean idempotent(TenantId tenant, String toolName) {
+        // M1 路由表没有租户维度，参数仅供端口对齐；M2 起一律走 ToolRegistry.forTenant 的租户视图
         Tool tool = tools.get(toolName);
         return tool != null && tool.idempotent();
     }

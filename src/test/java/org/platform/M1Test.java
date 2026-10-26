@@ -608,8 +608,8 @@ class M1Test {
         }
 
         @Override
-        public boolean idempotent(String toolName) {
-            return inner.idempotent(toolName);
+        public boolean idempotent(TenantId tenant, String toolName) {
+            return inner.idempotent(tenant, toolName);
         }
     }
 }

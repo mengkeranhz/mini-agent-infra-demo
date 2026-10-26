@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -118,7 +119,7 @@ public final class AgentLoop implements HarnessAdapter {
         int attempt = attempts.merge(call.id(), 1, Integer::sum);
         // 计划段先落盘：toolName / inputDigest / idempotent，恢复裁决全靠这三个字段
         journal.append(new JournalEvent.StepPlanned(tenant, stepId, call.id(), call.name(),
-                call.inputDigest(), tools.idempotent(call.name())));
+                call.inputDigest(), tools.idempotent(tenant, call.name())));
         // 发起段必须在真正调用之前落盘（write-ahead）：
         // 崩溃若发生在这之后、Done 之前，恢复时只能按「可能已执行」处理，不敢直接重发
         journal.append(new JournalEvent.StepDispatched(tenant, stepId, call.id(), attempt));
@@ -215,7 +216,7 @@ public final class AgentLoop implements HarnessAdapter {
         Map<String, JournalEvent.StepPlanned> plannedByToolUse = new HashMap<>();
         Map<String, Integer> attemptByToolUse = new HashMap<>();
         Set<String> resolvedToolUse = new HashSet<>();
-        Set<String> adjudicatedToolUse = new HashSet<>();
+        Set<String> adjudicatedToolUse = new LinkedHashSet<>();   // 保序：重放重建的集合不引入 hash 序
         Set<String> approvalPendingToolUse = new HashSet<>();
         int lastDoneSeq = -1;
         boolean started = false;

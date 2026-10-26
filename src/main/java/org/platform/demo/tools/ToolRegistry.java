@@ -67,9 +67,9 @@ public final class ToolRegistry {
         return new View(Map.copyOf(visible));
     }
 
-    /** 按名查幂等性（harness 写 StepPlanned 用）：查无此工具按非幂等处理——宁可保守。 */
-    public boolean idempotent(String toolName) {
-        Registration reg = tools.get(toolName);
-        return reg != null && reg.tool().idempotent();
+    /** 按名查幂等性（harness 写 StepPlanned 用）：走租户视图，与网关第 1 步同一口径——
+     *  本租户查无此工具（别家的、不存在的）按非幂等处理，宁可保守。 */
+    public boolean idempotent(TenantId tenant, String toolName) {
+        return forTenant(tenant).find(toolName).map(r -> r.tool().idempotent()).orElse(false);
     }
 }
