@@ -28,7 +28,7 @@ public final class UncertainStepException extends RuntimeException {
             if (msg.length() > 0) {
                 msg.append('；');
             }
-            msg.append("悬空步 ").append(step.stepId().runId()).append('#').append(step.stepId().seq())
+            msg.append("悬空步 ").append(step.runId().value()).append('#').append(step.stepId().seq())
                     .append(' ').append(step.toolUseId())
                     .append(" (").append(step.toolName()).append(' ')
                     .append(step.inputDigest(), 0, Math.min(19, step.inputDigest().length())).append("...)")

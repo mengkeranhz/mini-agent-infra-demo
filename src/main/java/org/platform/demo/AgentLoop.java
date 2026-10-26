@@ -235,7 +235,7 @@ public final class AgentLoop implements HarnessAdapter {
         for (String toolUseId : attemptByToolUse.keySet()) {
             if (!resolvedToolUse.contains(toolUseId) && plannedByToolUse.containsKey(toolUseId)) {
                 JournalEvent.StepPlanned planned = plannedByToolUse.get(toolUseId);
-                uncertain.add(new Uncertain(planned.stepId(),
+                uncertain.add(new Uncertain(planned.tenantId(), planned.runId(), planned.stepId(),
                         planned.toolUseId(), planned.toolName(), planned.idempotent(),
                         attemptByToolUse.get(toolUseId), planned.inputDigest()));
             }
