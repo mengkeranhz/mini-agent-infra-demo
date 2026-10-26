@@ -17,14 +17,18 @@ public final class FakeMailbox {
 
     /** 投递一封信；同键重试不投，但返回首次投递的真实结果。 */
     public String deliver(ExternalIdempotencyKey key, String msg) {
-        String prev = results.putIfAbsent(key, "ok");
-        if (prev != null) {
+        // computeIfAbsent 里才真投：首次执行返回什么就存什么，重放还的是首次存下的 content——
+        // 占位符（"DUPLICATE-IGNORED" 之类）不行，重放必须 ≡ 首次执行，模型两次看到的 content 才一致
+        boolean replay = results.containsKey(key);
+        String content = results.computeIfAbsent(key, k -> {
+            deliveredCount.incrementAndGet();
+            System.out.println("DELIVERED: " + msg);
+            return "ok";
+        });
+        if (replay) {
             System.out.println("MAILBOX-REPLAY: " + msg);
-            return prev;
         }
-        deliveredCount.incrementAndGet();
-        System.out.println("DELIVERED: " + msg);
-        return "ok";
+        return content;
     }
 
     /** 真实投递次数——测试靠它分清「拦住双发的是平台层还是下游」。 */

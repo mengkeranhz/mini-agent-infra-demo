@@ -1,6 +1,7 @@
 package org.platform.demo;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -130,10 +131,13 @@ public final class AgentLoop implements HarnessAdapter {
      * 为什么麻烦：进程可能死在「已声明发起、结果未落盘」之间——副作用可能已经发生，
      * 也可能压根没来得及执行，journal 无法区分这两种情况。
      *
+     * 先全量过一遍，处理不了的攒起来一次挂起——撞上第一个等人的就 throw，
+     * N 个悬空步就得人工来 N 趟，每趟只裁决最先撞上的那一个。
+     *
      * 分支，按风险从低到高：
      * 1. 幂等 + 未到重试上限 → 重跑无害，交给主循环重新走全流程；
      * 2. 收据在（含到上限的幂等步）→ 不再调用工具，用收据内容直接补一条 Done；
-     * 3. 无法证明结果 → 落一条 StepResolution（awaiting_human）记下原因，抛异常挂起本 run：
+     * 3. 无法证明结果 → 落一条 StepResolution（awaiting_human）记下原因，打包抛异常挂起本 run：
      *    非幂等无收据，或幂等但连续 MAX_ATTEMPTS 次仍悬空（环境多半出了系统性问题）。
      *
      * 第 3 分支的 StepResolution 不能省：判定本身必须落盘——否则每次重启都重新发现
@@ -143,6 +147,7 @@ public final class AgentLoop implements HarnessAdapter {
      */
     private void adjudicate(RunId runId, List<Msg> messages, List<Uncertain> uncertain,
             Set<String> adjudicatedToolUse) {
+        List<Uncertain> awaiting = new ArrayList<>();
         for (Uncertain u : uncertain) {
             if (u.idempotent() && u.attempt() < MAX_ATTEMPTS) {
                 continue;
@@ -154,15 +159,19 @@ public final class AgentLoop implements HarnessAdapter {
                 messages.add(Msg.tool(u.toolUseId(), receipt.content()));
                 continue;
             }
-            if (adjudicatedToolUse.contains(u.toolUseId())) {
-                // 已裁定过等人、收据也还没回来：静默重抛同一条异常，不再堆第二条裁定
-                throw new UncertainStepException(u, reasonOf(u));
-            }
-            String reason = reasonOf(u);
-            journal.append(new JournalEvent.StepResolution(tenant, u.stepId(), u.toolUseId(),
-                    "awaiting_human", reason, null));
-            throw new UncertainStepException(u, reason);
+            awaiting.add(u);
         }
+        if (awaiting.isEmpty()) {
+            return;
+        }
+        for (Uncertain u : awaiting) {
+            if (adjudicatedToolUse.contains(u.toolUseId())) {
+                continue; // 已裁定过等人、收据也还没回来：静默重抛，不再堆第二条裁定
+            }
+            journal.append(new JournalEvent.StepResolution(tenant, u.stepId(), u.toolUseId(),
+                    "awaiting_human", reasonOf(u), null));
+        }
+        throw new UncertainStepException(awaiting, this::reasonOf);
     }
 
     /** 挂起理由：非幂等无收据说不清结果；幂等重跑到上限说明环境出了系统性问题。 */
@@ -231,6 +240,9 @@ public final class AgentLoop implements HarnessAdapter {
                         attemptByToolUse.get(toolUseId), planned.inputDigest()));
             }
         }
+        // keySet() 出自 HashMap，无序——多个悬空步时裁决顺序、按收据回放补消息的顺序都会随 hash 漂移，
+        // 恢复必须可复现：按计划段 seq 排（不同 toolUseId 首次派发的 seq 必不相同，是全序）
+        uncertain.sort(Comparator.comparingInt(u -> u.stepId().seq()));
         return uncertain;
     }
 }
