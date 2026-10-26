@@ -26,19 +26,20 @@ import org.platform.kernel.port.ToolGateway;
 public class Main {
 
     public static void main(String[] args) throws IOException {
-        TenantId tenant = TenantId.DEFAULT;
+        // M2 换真实租户来源；这里必须显式给值——不设全局默认租户，默认等于全平台共用一个分区
+        TenantId tenant = new TenantId("demo");
         RunId runId = RunId.generate();
         System.out.println("runId = " + runId.value());
         ModelGateway model = new StubModelGateway();
-        ReceiptStore receipts = new FileReceiptStore(Path.of("target", "receipts.jsonl"));
+        ReceiptStore receipts = new FileReceiptStore(Path.of("target", "receipts"));
         ToolGateway tools = new IdempotentToolWrapper(
                 new ToolRouter(new WebSearchTool(), new SendMessageTool(new FakeMailbox())), receipts);
-        Journal journal = new FileJournal(Path.of("target", "journal.jsonl"));
+        Journal journal = new FileJournal(Path.of("target", "journal"));
         HarnessAdapter harness = new AgentLoop(tenant, tools, model, journal, receipts);
         String answer = harness.run(runId, "跑通幂等 + 非幂等两个工具");
         System.out.println("answer = " + answer);
         System.out.println("---- journal scan ----");
-        for (JournalEvent event : journal.scan()) {
+        for (JournalEvent event : journal.scan(tenant, runId, -1L)) {
             System.out.println(describe(event));
         }
     }

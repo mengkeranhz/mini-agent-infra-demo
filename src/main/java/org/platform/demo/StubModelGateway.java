@@ -25,10 +25,12 @@ public final class StubModelGateway implements ModelGateway {
                             {"query":"agent kernel"}""")));
         }
         if (!sent) {
+            // campaign 带上租户：下游的外层幂等键（to/campaign/seq）看不到平台上下文，
+            // 业务键不带租户就会跨租户撞车——别家先发过同名 campaign，本家的消息会被下游当重放吞掉
             return new ModelResponse(
                     "搜到结果了，发条消息收尾。",
                     List.of(new ToolUse(SEND_CALL, "send_message", """
-                            {"to":"ops","campaign":"m1-demo","seq":1,"msg":"hello kernel"}""")));
+                            {"to":"ops","campaign":"%s","seq":1,"msg":"hello kernel"}""".formatted("m1-" + ctx.tenantId().value()))));
         }
         return ModelResponse.of("消息已发出，run 结束。");
     }
