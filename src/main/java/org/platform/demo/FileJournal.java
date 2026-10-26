@@ -18,6 +18,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import org.platform.kernel.JournalEvent;
+import org.platform.kernel.JournalEvent.RunWaiting;
 import org.platform.kernel.JournalEvent.RunFinished;
 import org.platform.kernel.JournalEvent.RunStarted;
 import org.platform.kernel.JournalEvent.StepDispatched;
@@ -135,6 +136,7 @@ public final class FileJournal implements Journal {
             case "StepDone" -> StepDone.class;
             case "StepFailed" -> StepFailed.class;
             case "StepResolution" -> StepResolution.class;
+            case "RunWaiting" -> RunWaiting.class;
             case "RunFinished" -> RunFinished.class;
             default -> throw new IllegalStateException("未知事件类型: " + kind);
         };

@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.platform.kernel.ApprovalRequiredException;
 import org.platform.kernel.JournalEvent;
 import org.platform.kernel.Receipt;
 import org.platform.kernel.Uncertain;
@@ -27,6 +28,9 @@ import org.platform.kernel.port.ToolGateway;
  * demo harness：最小 agent 循环——采样、执行工具、写回 messages 与 journal，直到模型不再要工具。
  * 网关、journal、收据仓全部构造器注入，本类不 new 任何基础设施。
  * run() 先查 journal：同 runId 已有进度就续跑——重建轨迹、裁决悬空步、步号接着分；跑完的 run 直接返回既有答案。
+ * 等审批挂起：网关在审批闸前抛 ApprovalRequiredException——这步没有结果（没执行、没失败），
+ * 不落任何终态事件、不往轨迹塞消息；落 StepResolution(awaiting_approval) + RunWaiting 后原样上抛，
+ * run 挂起、RunFinished 不落。批条落地后同 runId 续跑，该步重新派发、重过审批闸，批条这才被消费。
  * 隔离：构造时注入的 tenant 写进每条事件，重放只经 journal.scan(tenant, runId)——
  * runId 只定位 run 不定位租户，猜中别家的 runId 也只会查到一个空 run。
  * 轨迹与重试计数是 run 的私有状态，收在 run() 局部变量里往下传——放实例字段，
@@ -67,8 +71,10 @@ public final class AgentLoop implements HarnessAdapter {
         List<Msg> messages = new ArrayList<>();
         // 本进程内每个工具调用（按 toolUseId）已发起的次数；重启时从 journal 的 Dispatched.attempt 归纳回来
         Map<String, Integer> attempts = new HashMap<>();
+        // 已落过 awaiting_approval 裁定的调用：等批期间反复续跑，裁定只落第一条（对齐 awaiting_human 的收敛语义）
+        Set<String> approvalPending = new HashSet<>();
         if (prior.started()) {
-            resumeFrom(messages, attempts, runId, prior);
+            resumeFrom(messages, attempts, approvalPending, runId, prior);
         } else {
             beginRun(messages, runId, task);
         }
@@ -80,7 +86,7 @@ public final class AgentLoop implements HarnessAdapter {
                 return finish(runId, resp.text());
             }
             for (ToolUse call : resp.toolUses()) {
-                stepId = executeCall(runId, stepId, call, messages, attempts);
+                stepId = executeCall(runId, stepId, call, messages, attempts, approvalPending);
             }
         }
     }
@@ -92,10 +98,12 @@ public final class AgentLoop implements HarnessAdapter {
     }
 
     /** 续跑：从 journal 重建轨迹，再裁决上次崩溃留下的悬空步。 */
-    private void resumeFrom(List<Msg> messages, Map<String, Integer> attempts, RunId runId, Replay prior) {
+    private void resumeFrom(List<Msg> messages, Map<String, Integer> attempts, Set<String> approvalPending,
+            RunId runId, Replay prior) {
         messages.addAll(prior.messages());
         attempts.putAll(prior.attemptByToolUse());
-        adjudicate(runId, messages, prior.uncertain(), prior.adjudicatedToolUse());
+        approvalPending.addAll(prior.approvalPendingToolUse());
+        adjudicate(runId, messages, prior.uncertain(), prior.adjudicatedToolUse(), approvalPending);
     }
 
     /** 模型不再要工具：run 收尾，答案落盘后返回。 */
@@ -104,9 +112,9 @@ public final class AgentLoop implements HarnessAdapter {
         return text;
     }
 
-    /** 一次工具调用的完整生命周期：Planned → Dispatched → invoke → Done/Failed；返回推进后的步号。 */
+    /** 一次工具调用的完整生命周期：Planned → Dispatched → invoke → Done/Failed（等批则挂起）；返回推进后的步号。 */
     private StepId executeCall(RunId runId, StepId stepId, ToolUse call, List<Msg> messages,
-            Map<String, Integer> attempts) {
+            Map<String, Integer> attempts, Set<String> approvalPending) {
         int attempt = attempts.merge(call.id(), 1, Integer::sum);
         // 计划段先落盘：toolName / inputDigest / idempotent，恢复裁决全靠这三个字段
         journal.append(new JournalEvent.StepPlanned(tenant, stepId, call.id(), call.name(),
@@ -114,7 +122,20 @@ public final class AgentLoop implements HarnessAdapter {
         // 发起段必须在真正调用之前落盘（write-ahead）：
         // 崩溃若发生在这之后、Done 之前，恢复时只能按「可能已执行」处理，不敢直接重发
         journal.append(new JournalEvent.StepDispatched(tenant, stepId, call.id(), attempt));
-        ToolResult result = tools.invoke(new StepCtx(tenant, runId, stepId), call);
+        ToolResult result;
+        try {
+            result = tools.invoke(new StepCtx(tenant, runId, stepId), call);
+        } catch (ApprovalRequiredException e) {
+            // 等批：工具没执行，这步没有结果——不写任何终态事件（Done/Failed 都是假装有结论），
+            // 也不往轨迹塞消息喂模型；裁定只落第一条，配 run 级状态事件一起挂起：
+            // 批条落地后同 runId 续跑，replay 不把该步当已了结 → 主循环重新派发、重过审批闸
+            if (approvalPending.add(call.id())) {
+                journal.append(new JournalEvent.StepResolution(tenant, stepId, call.id(),
+                        JournalEvent.RESOLUTION_AWAITING_APPROVAL, e.getMessage(), null));
+            }
+            journal.append(new JournalEvent.RunWaiting(tenant, runId, e.getMessage()));
+            throw e;   // 原样上抛：run 挂起，finish() 不会执行，RunFinished 不落
+        }
         if (result.isError()) {
             journal.append(new JournalEvent.StepFailed(tenant, stepId, call.id(), result.content()));
         } else {
@@ -127,6 +148,9 @@ public final class AgentLoop implements HarnessAdapter {
 
     /**
      * 恢复裁决：处理上次崩溃留下的「说不清执行没执行」的工具调用（悬空步）。
+     *
+     * 等审批的悬空步（StepResolution.awaiting_approval）不进这里：审批闸在执行之前，
+     * 确定没执行过——无需裁决，主循环重新派发即可，网关会再过一遍第 6 步。
      *
      * 为什么麻烦：进程可能死在「已声明发起、结果未落盘」之间——副作用可能已经发生，
      * 也可能压根没来得及执行，journal 无法区分这两种情况。
@@ -146,9 +170,12 @@ public final class AgentLoop implements HarnessAdapter {
      * 不再写第二条裁定——否则 M2 的事件订阅、M5 的审计会为每次重启各开一张工单。
      */
     private void adjudicate(RunId runId, List<Msg> messages, List<Uncertain> uncertain,
-            Set<String> adjudicatedToolUse) {
+            Set<String> adjudicatedToolUse, Set<String> approvalPending) {
         List<Uncertain> awaiting = new ArrayList<>();
         for (Uncertain u : uncertain) {
+            if (approvalPending.contains(u.toolUseId())) {
+                continue;   // 等批 ≠ 崩溃悬空：确定没执行，重发即真相——网关会再过一遍第 6 步
+            }
             if (u.idempotent() && u.attempt() < MAX_ATTEMPTS) {
                 continue;
             }
@@ -169,7 +196,7 @@ public final class AgentLoop implements HarnessAdapter {
                 continue; // 已裁定过等人、收据也还没回来：静默重抛，不再堆第二条裁定
             }
             journal.append(new JournalEvent.StepResolution(tenant, u.stepId(), u.toolUseId(),
-                    "awaiting_human", reasonOf(u), null));
+                    JournalEvent.RESOLUTION_AWAITING_HUMAN, reasonOf(u), null));
         }
         throw new UncertainStepException(awaiting, this::reasonOf);
     }
@@ -189,6 +216,7 @@ public final class AgentLoop implements HarnessAdapter {
         Map<String, Integer> attemptByToolUse = new HashMap<>();
         Set<String> resolvedToolUse = new HashSet<>();
         Set<String> adjudicatedToolUse = new HashSet<>();
+        Set<String> approvalPendingToolUse = new HashSet<>();
         int lastDoneSeq = -1;
         boolean started = false;
         boolean finished = false;
@@ -217,7 +245,16 @@ public final class AgentLoop implements HarnessAdapter {
                     finished = true;
                     answer = ev.answer();
                 }
-                case JournalEvent.StepResolution ev -> adjudicatedToolUse.add(ev.toolUseId());
+                // RunWaiting 是 run 级状态事件：重放不消费——挂起与否看步级 awaiting_approval 裁定
+                case JournalEvent.RunWaiting ev -> { }
+                case JournalEvent.StepResolution ev -> {
+                    // 等批与等裁决分开记：前者确定没执行（续跑重发），后者说不清（等人工定结果）
+                    if (JournalEvent.RESOLUTION_AWAITING_APPROVAL.equals(ev.resolution())) {
+                        approvalPendingToolUse.add(ev.toolUseId());
+                    } else {
+                        adjudicatedToolUse.add(ev.toolUseId());
+                    }
+                }
             }
         }
         if (started) {
@@ -225,7 +262,7 @@ public final class AgentLoop implements HarnessAdapter {
         }
         return new Replay(started, finished, answer, lastDoneSeq,
                 rebuilt, uncertainOf(plannedByToolUse, attemptByToolUse, resolvedToolUse),
-                adjudicatedToolUse, attemptByToolUse);
+                adjudicatedToolUse, approvalPendingToolUse, attemptByToolUse);
     }
 
     /** 悬空步 = 已派发（Dispatched）但没有任何终态（Done/Failed）的调用，配上计划段的元数据。 */

@@ -7,7 +7,8 @@ import org.platform.kernel.id.StepId;
 import org.platform.kernel.id.TenantId;
 
 /**
- * journal 事件：sealed 六种。RunStarted/RunFinished 框住一次 run；
+ * journal 事件：sealed 七种。RunStarted/RunWaiting/RunFinished 标注 run 级状态
+ * （RUNNING → WAITING_APPROVAL →（批条落地续跑）RUNNING → … → RunFinished）；
  * StepPlanned/StepDispatched/StepDone|Failed 三段按 toolUseId 对齐——身份看 toolUseId，
  * stepId.seq 只记事件发生的位置，重放不得拿它当 join key（真 LLM 重放不保证序列一致，seq 会漂移）。
  * 每条事件自带 tenantId：runId 只能定位 run，定位不了「谁的 run」——没有 tenant 维度，
@@ -18,7 +19,7 @@ import org.platform.kernel.id.TenantId;
 public sealed interface JournalEvent
         permits JournalEvent.RunStarted, JournalEvent.StepPlanned, JournalEvent.StepDispatched,
                 JournalEvent.StepDone, JournalEvent.StepFailed, JournalEvent.StepResolution,
-                JournalEvent.RunFinished {
+                JournalEvent.RunWaiting, JournalEvent.RunFinished {
 
     /** 事件归属的租户——第一隔离维度，与 runId 一起构成事件的完整身份。 */
     TenantId tenantId();
@@ -29,6 +30,10 @@ public sealed interface JournalEvent
     /** StepDone.source 的取值：真执行 / 崩溃后从收据回放补的。 */
     String SOURCE_EXECUTED = "executed";
     String SOURCE_REPLAYED_FROM_RECEIPT = "replayed_from_receipt";
+
+    /** StepResolution.resolution 的取值：崩溃悬空转人工裁决 / 审批闸前挂起等批条。 */
+    String RESOLUTION_AWAITING_HUMAN = "awaiting_human";
+    String RESOLUTION_AWAITING_APPROVAL = "awaiting_approval";
 
     record RunStarted(TenantId tenantId, RunId runId, String task) implements JournalEvent {
 
@@ -90,9 +95,11 @@ public sealed interface JournalEvent
     }
 
     /**
-     * 裁决段：恢复时对悬空步的判定结论——判定本身必须落盘，否则挂起状态重启后不可见、永远收敛不了。
-     * 只用于 awaiting_human：回放收据的判定已并入 StepDone.source = replayed_from_receipt；
-     * reason 记为什么挂起，result 预留人工裁决后的回填。
+     * 裁决段：对悬空步的判定结论——判定本身必须落盘，否则挂起状态重启后不可见、永远收敛不了。
+     * awaiting_human：崩溃悬空说不清结果，人工裁决的是「执行了没有」，result 预留裁决后的回填；
+     * awaiting_approval：审批闸前挡下，确定没执行，人工要做的只是批或不批——
+     * 批条落进审批仓后同 runId 续跑，该步重新派发、重过网关审批闸。
+     * 回放收据的判定已并入 StepDone.source = replayed_from_receipt。
      */
     record StepResolution(TenantId tenantId, StepId stepId, String toolUseId, String resolution, String reason,
                           String result) implements JournalEvent {
@@ -104,6 +111,18 @@ public sealed interface JournalEvent
         @Override
         public RunId runId() {
             return new RunId(stepId.runId());
+        }
+    }
+
+    /**
+     * run 级状态事件：因等审批挂起（RUNNING → WAITING_APPROVAL）。续跑即回 RUNNING，
+     * 再撞闸会再落一条——每次转移一条，订阅方（审计/工单）按它开窗，不必去数步级事件。
+     * 步级悬而未决仍由 StepResolution(awaiting_approval) 表达，两者职责分开。
+     */
+    record RunWaiting(TenantId tenantId, RunId runId, String reason) implements JournalEvent {
+
+        public RunWaiting {
+            Objects.requireNonNull(tenantId, "tenantId");
         }
     }
 

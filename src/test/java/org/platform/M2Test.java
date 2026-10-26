@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Set;
 
 import org.junit.jupiter.api.Test;
@@ -27,6 +28,7 @@ import org.platform.demo.tools.Tool;
 import org.platform.demo.tools.ToolRegistry;
 import org.platform.demo.tools.WebSearchTool;
 import org.platform.kernel.ApprovalRecord;
+import org.platform.kernel.ApprovalRequiredException;
 import org.platform.kernel.JournalEvent;
 import org.platform.kernel.id.RunId;
 import org.platform.kernel.id.StepCtx;
@@ -40,6 +42,7 @@ import org.platform.kernel.port.ToolGateway;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 /** M2 验收：十二步网关——权限、审批、幂等、审计四道闸全在唯一出口上，红线（Agent 不直连外部）不破。 */
 class M2Test {
@@ -136,13 +139,12 @@ class M2Test {
                 new MemoryArtifactStore(), audit);
         ToolUse call = send("t-9");
 
-        ToolResult result = tools.invoke(ctx(ACME, runId), call);
-
-        assertThat(result.isError()).isTrue();
-        // 工单即拒绝消息：人照着它就能把批条七字段填全
-        assertThat(result.content()).contains("需要人工审批").contains("无批条")
-                .contains("send_message@1.2.0").contains(call.inputDigest())
-                .contains("target=mailbox").contains("toolUseId=t-9");
+        // 无结果不走结果通道：等批抛异常，工单即异常消息——人照着它就能把批条七字段填全
+        assertThatThrownBy(() -> tools.invoke(ctx(ACME, runId), call))
+                .isInstanceOf(ApprovalRequiredException.class)
+                .hasMessageContaining("需要人工审批").hasMessageContaining("无批条")
+                .hasMessageContaining("send_message@1.2.0").hasMessageContaining(call.inputDigest())
+                .hasMessageContaining("target=mailbox").hasMessageContaining("toolUseId=t-9");
         assertThat(mailbox.deliveredCount()).isZero();
         assertThat(audit.events()).extracting(AuditLog.Event::outcome).containsExactly("awaiting_approval");
     }
@@ -157,23 +159,23 @@ class M2Test {
         // 摘要不符：批的是别的内容
         ApprovalRecord wrongDigest = new ApprovalRecord("send_message", "1.2.0",
                 "sha256:" + "0".repeat(64), "mailbox", ACME, runId, "t-9", validUntil, APPROVER);
-        assertThat(askGateway(wrongDigest, mailbox, runId).invoke(ctx(ACME, runId), call).content())
-                .contains("摘要不符");
+        assertThatThrownBy(() -> askGateway(wrongDigest, mailbox, runId).invoke(ctx(ACME, runId), call))
+                .isInstanceOf(ApprovalRequiredException.class).hasMessageContaining("摘要不符");
         // 版本不符：批的不是这个 release
         ApprovalRecord wrongVersion = new ApprovalRecord("send_message", "9.9.9",
                 call.inputDigest(), "mailbox", ACME, runId, "t-9", validUntil, APPROVER);
-        assertThat(askGateway(wrongVersion, mailbox, runId).invoke(ctx(ACME, runId), call).content())
-                .contains("版本不符");
+        assertThatThrownBy(() -> askGateway(wrongVersion, mailbox, runId).invoke(ctx(ACME, runId), call))
+                .isInstanceOf(ApprovalRequiredException.class).hasMessageContaining("版本不符");
         // 目标资源不符
         ApprovalRecord wrongTarget = new ApprovalRecord("send_message", "1.2.0",
                 call.inputDigest(), "smtp", ACME, runId, "t-9", validUntil, APPROVER);
-        assertThat(askGateway(wrongTarget, mailbox, runId).invoke(ctx(ACME, runId), call).content())
-                .contains("目标资源不符");
+        assertThatThrownBy(() -> askGateway(wrongTarget, mailbox, runId).invoke(ctx(ACME, runId), call))
+                .isInstanceOf(ApprovalRequiredException.class).hasMessageContaining("目标资源不符");
         // 过期：陈年批条等于没有批条
         ApprovalRecord expired = new ApprovalRecord("send_message", "1.2.0",
                 call.inputDigest(), "mailbox", ACME, runId, "t-9", Instant.now().minusSeconds(1), APPROVER);
-        assertThat(askGateway(expired, mailbox, runId).invoke(ctx(ACME, runId), call).content())
-                .contains("已过期");
+        assertThatThrownBy(() -> askGateway(expired, mailbox, runId).invoke(ctx(ACME, runId), call))
+                .isInstanceOf(ApprovalRequiredException.class).hasMessageContaining("已过期");
         // 七字段全对且未过期：放行，真发一次
         ApprovalRecord valid = new ApprovalRecord("send_message", "1.2.0",
                 call.inputDigest(), "mailbox", ACME, runId, "t-9", validUntil, APPROVER);
@@ -329,33 +331,66 @@ class M2Test {
     }
 
     @Test
-    void ASK集成_无批条_run收尾零副作用_工单进journal() throws IOException {
+    void ASK集成_等审批挂起_批条落地续跑_批条被消费() throws IOException {
         Path journalDir = dataDir("m2-ask-journal");
         RunId runId = RunId.generate();
         FakeMailbox mailbox = new FakeMailbox();
         MemoryAuditLog audit = new MemoryAuditLog();
         ReceiptStore receipts = new MemoryReceiptStore();
+        MemoryApprovalStore approvals = new MemoryApprovalStore();
         ToolGateway tools = new GatedToolGateway(registry(ACME, mailbox), AGENT,
-                StaticPolicy.asking("send_message"), new MemoryApprovalStore(), receipts,
+                StaticPolicy.asking("send_message"), approvals, receipts,
                 new MemoryArtifactStore(), audit);
+        AgentLoop harness = new AgentLoop(ACME, tools, new StubModelGateway(),
+                new FileJournal(journalDir), receipts);
 
-        String answer = new AgentLoop(ACME, tools, new StubModelGateway(),
-                new FileJournal(journalDir), receipts).run(runId, "任务");
-
-        // 拒绝走错误结果：run 照常收尾（桩模型见到 t-2 的工具消息就终答），一条消息都没发
-        assertThat(answer).isEqualTo("消息已发出，run 结束。");
+        // 第一趟：搜索放行，发消息撞审批闸 → run 挂起——不是收尾，零副作用
+        ApprovalRequiredException suspended = catchThrowableOfType(
+                () -> harness.run(runId, "任务"), ApprovalRequiredException.class);
+        assertThat(suspended).hasMessageContaining("需要人工审批").hasMessageContaining("toolUseId=t-2");
         assertThat(mailbox.deliveredCount()).isZero();
-        // 工单随 StepFailed 落进 journal——人工从这里看到要批什么
-        assertThat(new FileJournal(journalDir).scan(ACME, runId, -1L).stream()
-                .filter(JournalEvent.StepFailed.class::isInstance)
-                .map(JournalEvent.StepFailed.class::cast)
-                .filter(e -> "t-2".equals(e.toolUseId()))
-                .findFirst().orElseThrow().error())
-                .contains("需要人工审批").contains("toolUseId=t-2");
+        // 工单随 awaiting_approval 裁定落 journal——人工从这里看到要批什么；
+        // 没有 StepFailed 假装出错、没有 RunFinished 假收尾（假收尾之后补批条就是死件）
+        assertThat(journalEvents(journalDir, runId))
+                .noneMatch(JournalEvent.RunFinished.class::isInstance)
+                .anyMatch(e -> e instanceof JournalEvent.StepResolution r
+                        && JournalEvent.RESOLUTION_AWAITING_APPROVAL.equals(r.resolution())
+                        && "t-2".equals(r.toolUseId())
+                        && r.reason().contains("需要人工审批") && r.reason().contains("toolUseId=t-2"));
         assertThat(audit.events()).extracting(AuditLog.Event::outcome)
                 .containsExactly("executed", "awaiting_approval");
-        // 已知口子：run 已 RunFinished，人工补批后同 runId 续跑只会拿旧答案——
-        // 批后重跑要走新 run，或等后续里程碑的挂起语义（M1 的 UncertainStepException 是现成挂起机制）
+        // run 级状态事件：每次挂起一条（RUNNING → WAITING_APPROVAL），订阅方按它开窗
+        assertThat(journalEvents(journalDir, runId).stream()
+                .filter(JournalEvent.RunWaiting.class::isInstance)).hasSize(1);
+
+        // 批条没来之前再续跑：同一场挂起，不堆第二条裁定、仍零副作用
+        assertThatThrownBy(() -> harness.run(runId, "任务"))
+                .isInstanceOf(ApprovalRequiredException.class);
+        assertThat(journalEvents(journalDir, runId).stream()
+                .filter(JournalEvent.StepResolution.class::isInstance)).hasSize(1);
+        assertThat(journalEvents(journalDir, runId).stream()
+                .filter(JournalEvent.RunWaiting.class::isInstance)).hasSize(2);   // 续跑回 RUNNING、再撞闸再挂：两次转移两条
+
+        // 人工照工单补批条（七字段对 t-2 的真实输入）→ 同 runId 续跑：
+        // t-2 重新派发、过闸、真发一次，run 这才收尾——批条被消费，不是死件
+        approvals.trySaveIfAbsent(new ApprovalRecord("send_message", "1.2.0",
+                new ToolUse("t-2", "send_message",
+                        "{\"to\":\"ops\",\"campaign\":\"m1-acme\",\"seq\":1,\"msg\":\"hello kernel\"}")
+                        .inputDigest(),
+                "mailbox", ACME, runId, "t-2", Instant.now().plusSeconds(3600), APPROVER));
+        String answer = harness.run(runId, "任务");
+
+        assertThat(answer).isEqualTo("消息已发出，run 结束。");
+        assertThat(mailbox.deliveredCount()).isEqualTo(1);
+        assertThat(journalEvents(journalDir, runId).stream()
+                .filter(JournalEvent.RunFinished.class::isInstance)).hasSize(1);
+        assertThat(audit.events()).extracting(AuditLog.Event::outcome)
+                .containsExactly("executed", "awaiting_approval", "awaiting_approval", "executed");
+    }
+
+    /** 该 run 的 journal 事件（重开文件读——挂起与续跑之间落盘的东西都从这里验）。 */
+    private static List<JournalEvent> journalEvents(Path journalDir, RunId runId) throws IOException {
+        return new FileJournal(journalDir).scan(ACME, runId, -1L);
     }
 
     /**

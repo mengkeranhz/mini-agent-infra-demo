@@ -83,6 +83,7 @@ public class Main {
             case JournalEvent.StepResolution ev -> key(ev.stepId()) + " StepResolution: " + ev.toolUseId()
                     + " " + ev.resolution() + " reason=" + ev.reason()
                     + (ev.result() != null ? " result=" + ev.result() : "");
+            case JournalEvent.RunWaiting ev -> ev.runId().value() + " RunWaiting: " + ev.reason();
             case JournalEvent.RunFinished ev -> ev.runId().value() + " RunFinished: " + ev.answer();
         };
     }

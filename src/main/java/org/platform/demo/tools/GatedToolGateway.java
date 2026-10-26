@@ -13,6 +13,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.platform.demo.ToolResult;
 import org.platform.demo.ToolUse;
 import org.platform.kernel.ApprovalRecord;
+import org.platform.kernel.ApprovalRequiredException;
 import org.platform.kernel.Receipt;
 import org.platform.kernel.id.IdempotencyKey;
 import org.platform.kernel.id.StepCtx;
@@ -34,7 +35,8 @@ import org.platform.kernel.port.ToolGateway;
  * 3 发布版本检查（注册表钉版本，未发布/已下线的版本不可调）
  * 4 schema 校验（必填字段缺失/JSON 不合法，执行前就拒）
  * 5 策略裁决（PolicyEngine 给 ALLOW/DENY/ASK）
- * 6 审批（ASK 必须有匹配且未过期的 Human 批条，七字段逐一核对）
+ * 6 审批（ASK 必须有匹配且未过期的 Human 批条，七字段逐一核对；挡下抛 ApprovalRequiredException——
+ *   无结果不走结果通道，harness 收到即挂起 run）
  * 7 幂等检查（同键收据在，回放不重执行；执行后收据立刻抢存）
  * 8 执行（工具异常照抛——崩溃语义与 M1 一致，窗口 [Dispatched, 收据落库) 内崩 = 悬空步）
  * 9 结果大小守卫（超限内容不进轨迹）
@@ -110,11 +112,13 @@ public final class GatedToolGateway implements ToolGateway {
             return audited(ctx, call, reg, "policy_denied", "策略拒绝: " + call.name());
         }
         // 6 审批：ASK 要有人批——机器批不出来，ApprovalRecord.approver 的类型就是闸
+        // 挡下即抛：这步没有结果（没执行、没失败）——走错误结果会让 harness 记 StepFailed、
+        // 假装这步有结论，模型接着采样、run 假收尾，人工后来补的批条永远没人消费
         if (decision == Decision.ASK) {
             ApprovalRecord approval = approvals.find(ctx.tenantId(), ctx.runId(), call.id()).orElse(null);
             String problem = approvalProblem(approval, reg, ctx, call);
             if (problem != null) {
-                return audited(ctx, call, reg, "awaiting_approval",
+                throw auditedPending(ctx, call, reg,
                         "需要人工审批（" + problem + "）；" + workOrder(reg, ctx, call));
             }
         }
@@ -164,6 +168,13 @@ public final class GatedToolGateway implements ToolGateway {
                                String outcome, String detail, boolean isError) {
         audit.append(event(ctx, call, reg, outcome, detail));
         return new ToolResult(call.id(), detail, isError);
+    }
+
+    /** 等批出口：审计留痕后抛异常——没有结果就不走结果通道（第 11/12 步只留给有结果的出口）。 */
+    private ApprovalRequiredException auditedPending(StepCtx ctx, ToolUse call, ToolRegistry.Registration reg,
+                                                      String detail) {
+        audit.append(event(ctx, call, reg, "awaiting_approval", detail));
+        return new ApprovalRequiredException(detail);
     }
 
     /** 审计事件：七字段身份 + 谁在何时、结果如何。 */
