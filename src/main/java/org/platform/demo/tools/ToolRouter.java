@@ -11,7 +11,7 @@ import org.platform.kernel.port.ToolGateway;
 /**
  * 工具网关实现：按名字路由到注入的工具表，未知工具只报错、不炸循环。
  * 兼任注册期把关：有副作用（非幂等）的工具必须声明提供外层幂等键，否则拒绝注册——
- * M2 的 ToolRegistry 会接管这道闸，现在闸位就在这。
+ * M2 起这道闸移入 ToolRegistry，注册走它；本类保留给 M1 验收装配，M2 装配见 GatedToolGateway。
  */
 public final class ToolRouter implements ToolGateway {
 

@@ -15,8 +15,8 @@ public record RunId(String value) {
         requireValid(value, "RunId");
     }
 
-    /** 同一套主键成分校验，供 StepId/TenantId/IdempotencyKey 复用，主键不双标。 */
-    static void requireValid(String value, String kind) {
+    /** 同一套主键成分校验，供 StepId/TenantId/IdempotencyKey/Principal/ApprovalRecord 复用，主键不双标。 */
+    public static void requireValid(String value, String kind) {
         Objects.requireNonNull(value, kind);
         // 额外禁 '/'、'\\' 与裸 "."/".."：id 会变成文件路径成分（journal/收据的目录名、文件名），放行就是路径穿越
         if (value.isEmpty() || value.length() > 64
