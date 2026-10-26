@@ -5,7 +5,8 @@ import org.platform.kernel.id.StepId;
 
 /**
  * journal 事件：sealed 六种。RunStarted/RunFinished 框住一次 run；
- * StepPlanned/StepDispatched/StepDone|Failed 三段共用一个 stepId。
+ * StepPlanned/StepDispatched/StepDone|Failed 三段按 toolUseId 对齐——身份看 toolUseId，
+ * stepId.seq 只记事件发生的位置，重放不得拿它当 join key（真 LLM 重放不保证序列一致，seq 会漂移）。
  * 落盘格式由 FileJournal 决定，kernel 不依赖序列化器。
  */
 public sealed interface JournalEvent

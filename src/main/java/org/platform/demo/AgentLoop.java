@@ -39,8 +39,8 @@ public final class AgentLoop implements HarnessAdapter {
     /** 只在内存里，进程死了就没了；恢复时轨迹从 journal 重建，不依赖它。 */
     private final List<Msg> messages = new ArrayList<>();
 
-    /** 本进程内每个 seq 已发起的次数；重启时从 journal 的 Dispatched.attempt 归纳回来。 */
-    private final Map<Integer, Integer> attempts = new HashMap<>();
+    /** 本进程内每个工具调用（按 toolUseId）已发起的次数；重启时从 journal 的 Dispatched.attempt 归纳回来。 */
+    private final Map<String, Integer> attempts = new HashMap<>();
 
     /** 同一步连续发起这么多回仍悬空，就不再自动重跑——多半是环境出了系统性问题，变成人的事。 */
     private static final int MAX_ATTEMPTS = 3;
@@ -91,8 +91,8 @@ public final class AgentLoop implements HarnessAdapter {
     /** 续跑：从 journal 重建轨迹，再裁决上次崩溃留下的悬空步。 */
     private void resumeFrom(RunId runId, Replay prior) {
         messages.addAll(prior.messages());
-        attempts.putAll(prior.maxAttempt());
-        adjudicate(runId, prior.uncertain(), prior.adjudicated());
+        attempts.putAll(prior.attemptByToolUse());
+        adjudicate(runId, prior.uncertain(), prior.adjudicatedToolUse());
     }
 
     /** 模型不再要工具：run 收尾，答案落盘后返回。 */
@@ -103,7 +103,7 @@ public final class AgentLoop implements HarnessAdapter {
 
     /** 一次工具调用的完整生命周期：Planned → Dispatched → invoke → Done/Failed；返回推进后的步号。 */
     private StepId executeCall(RunId runId, StepId stepId, ToolUse call) {
-        int attempt = attempts.merge(stepId.seq(), 1, Integer::sum);
+        int attempt = attempts.merge(call.id(), 1, Integer::sum);
         // 计划段先落盘：toolName / inputDigest / idempotent，恢复裁决全靠这三个字段
         journal.append(new JournalEvent.StepPlanned(stepId, call.id(), call.name(),
                 call.inputDigest(), tools.idempotent(call.name())));
@@ -138,7 +138,7 @@ public final class AgentLoop implements HarnessAdapter {
      * 落了之后 replay() 会记住「已裁定」：收据没回来之前再重启，直接重抛异常、
      * 不再写第二条裁定——否则 M2 的事件订阅、M5 的审计会为每次重启各开一张工单。
      */
-    private void adjudicate(RunId runId, List<Uncertain> uncertain, Set<Integer> adjudicated) {
+    private void adjudicate(RunId runId, List<Uncertain> uncertain, Set<String> adjudicatedToolUse) {
         for (Uncertain u : uncertain) {
             if (u.idempotent() && u.attempt() < MAX_ATTEMPTS) {
                 continue;
@@ -150,7 +150,7 @@ public final class AgentLoop implements HarnessAdapter {
                 messages.add(Msg.tool(u.toolUseId(), receipt.content()));
                 continue;
             }
-            if (adjudicated.contains(u.stepId().seq())) {
+            if (adjudicatedToolUse.contains(u.toolUseId())) {
                 // 已裁定过等人、收据也还没回来：静默重抛同一条异常，不再堆第二条裁定
                 throw new UncertainStepException(u, reasonOf(u));
             }
@@ -170,10 +170,12 @@ public final class AgentLoop implements HarnessAdapter {
     /** 从 journal 重放同 runId 的既有进度：跑没跑过、跑到哪、轨迹长什么样、哪些步悬空。 */
     private Replay replay(RunId runId) {
         List<Msg> rebuilt = new ArrayList<>();
-        Map<Integer, JournalEvent.StepPlanned> plannedBySeq = new HashMap<>();
-        Map<Integer, Integer> maxAttempt = new HashMap<>();
-        Set<Integer> resolved = new HashSet<>();
-        Set<Integer> adjudicated = new HashSet<>();
+        // 身份一律按 toolUseId 对齐，seq 不当 join key——真 LLM 重放序列会漂移，按 seq 对不上
+        Map<String, JournalEvent.StepPlanned> plannedByToolUse = new HashMap<>();
+        Map<String, Integer> attemptByToolUse = new HashMap<>();
+        Set<String> resolvedToolUse = new HashSet<>();
+        Set<String> adjudicatedToolUse = new HashSet<>();
+        int lastDoneSeq = -1;
         boolean started = false;
         boolean finished = false;
         String answer = null;
@@ -187,42 +189,43 @@ public final class AgentLoop implements HarnessAdapter {
                     started = true;
                     task = ev.task();
                 }
-                case JournalEvent.StepPlanned ev -> plannedBySeq.put(ev.stepId().seq(), ev);
-                case JournalEvent.StepDispatched ev -> maxAttempt.merge(ev.stepId().seq(), ev.attempt(), Math::max);
+                case JournalEvent.StepPlanned ev -> plannedByToolUse.put(ev.toolUseId(), ev);
+                case JournalEvent.StepDispatched ev -> attemptByToolUse.merge(ev.toolUseId(), ev.attempt(), Math::max);
                 case JournalEvent.StepDone ev -> {
                     rebuilt.add(Msg.tool(ev.toolUseId(), ev.content()));
-                    resolved.add(ev.stepId().seq());
+                    resolvedToolUse.add(ev.toolUseId());
+                    lastDoneSeq = Math.max(lastDoneSeq, ev.stepId().seq());
                 }
                 case JournalEvent.StepFailed ev -> {
                     rebuilt.add(Msg.tool(ev.toolUseId(), ev.error()));
-                    resolved.add(ev.stepId().seq());
+                    resolvedToolUse.add(ev.toolUseId());
+                    lastDoneSeq = Math.max(lastDoneSeq, ev.stepId().seq());
                 }
                 case JournalEvent.RunFinished ev -> {
                     finished = true;
                     answer = ev.answer();
                 }
-                case JournalEvent.StepResolution ev -> adjudicated.add(ev.stepId().seq());
+                case JournalEvent.StepResolution ev -> adjudicatedToolUse.add(ev.toolUseId());
             }
         }
         if (started) {
             rebuilt.add(0, Msg.user(task));
         }
-        return new Replay(started, finished, answer,
-                resolved.stream().max(Integer::compareTo).orElse(-1),
-                rebuilt, uncertainOf(runId, plannedBySeq, maxAttempt, resolved), adjudicated, maxAttempt);
+        return new Replay(started, finished, answer, lastDoneSeq,
+                rebuilt, uncertainOf(plannedByToolUse, attemptByToolUse, resolvedToolUse),
+                adjudicatedToolUse, attemptByToolUse);
     }
 
-    /** 悬空步 = 已派发（Dispatched）但没有任何终态（Done/Failed）的步，配上计划段的元数据。 */
-    private static List<Uncertain> uncertainOf(RunId runId,
-            Map<Integer, JournalEvent.StepPlanned> plannedBySeq, Map<Integer, Integer> maxAttempt,
-            Set<Integer> resolved) {
+    /** 悬空步 = 已派发（Dispatched）但没有任何终态（Done/Failed）的调用，配上计划段的元数据。 */
+    private static List<Uncertain> uncertainOf(Map<String, JournalEvent.StepPlanned> plannedByToolUse,
+            Map<String, Integer> attemptByToolUse, Set<String> resolvedToolUse) {
         List<Uncertain> uncertain = new ArrayList<>();
-        for (int seq : maxAttempt.keySet()) {
-            if (!resolved.contains(seq) && plannedBySeq.containsKey(seq)) {
-                JournalEvent.StepPlanned planned = plannedBySeq.get(seq);
-                uncertain.add(new Uncertain(new StepId(runId.value(), seq),
+        for (String toolUseId : attemptByToolUse.keySet()) {
+            if (!resolvedToolUse.contains(toolUseId) && plannedByToolUse.containsKey(toolUseId)) {
+                JournalEvent.StepPlanned planned = plannedByToolUse.get(toolUseId);
+                uncertain.add(new Uncertain(planned.stepId(),
                         planned.toolUseId(), planned.toolName(), planned.idempotent(),
-                        maxAttempt.get(seq), planned.inputDigest()));
+                        attemptByToolUse.get(toolUseId), planned.inputDigest()));
             }
         }
         return uncertain;
