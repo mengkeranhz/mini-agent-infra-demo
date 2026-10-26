@@ -20,6 +20,8 @@ import org.platform.demo.FileJournal;
 import org.platform.demo.FileReceiptStore;
 import org.platform.demo.IdempotentToolWrapper;
 import org.platform.demo.MemoryReceiptStore;
+import org.platform.demo.ModelResponse;
+import org.platform.demo.Msg;
 import org.platform.demo.StubModelGateway;
 import org.platform.demo.ToolResult;
 import org.platform.demo.ToolUse;
@@ -31,6 +33,7 @@ import org.platform.demo.tools.WebSearchTool;
 import org.platform.kernel.ExternalIdempotencyKey;
 import org.platform.kernel.JournalEvent;
 import org.platform.kernel.Receipt;
+import org.platform.kernel.Uncertain;
 import org.platform.kernel.UncertainStepException;
 import org.platform.kernel.id.IdempotencyKey;
 import org.platform.kernel.id.RunId;
@@ -38,11 +41,13 @@ import org.platform.kernel.id.StepCtx;
 import org.platform.kernel.id.StepId;
 import org.platform.kernel.id.TenantId;
 import org.platform.kernel.port.Journal;
+import org.platform.kernel.port.ModelGateway;
 import org.platform.kernel.port.ReceiptStore;
 import org.platform.kernel.port.ToolGateway;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 /** M1 验收：崩溃恢复副作用不重复、半行截断、并发同键只执行一次、跨租户隔离。 */
 class M1Test {
@@ -313,6 +318,72 @@ class M1Test {
     }
 
     @Test
+    void 多悬空步一次打包挂起_人工一趟收尾() throws IOException {
+        Path journalDir = dataDir("pack-suspend");
+        TenantId tenant = new TenantId("pack");
+        RunId runId = RunId.generate();
+        FakeMailbox mailbox = new FakeMailbox();
+        CountingSend send = new CountingSend(mailbox);
+        ToolGateway tools = new ToolRouter(send);
+        // 人工补的收据就进这个仓，整个测试共用一个实例——恢复裁决查的必须是同一个仓
+        ReceiptStore receipts = new MemoryReceiptStore();
+        String task = "连发两条消息";
+
+        // 串行 harness 的崩溃只会留下最后一个在途步（上一步 Done 不落盘，循环走不到下一步），
+        // 两个悬空步靠崩溃闸门造不出来，只能按 journal 契约播种；
+        // 并行/批量派发落地后，崩溃窗口自然会留下这个状态。旧实现第一趟只裁最先撞上的那步就挂起，
+        // 第二步要等下一趟——本测试锁死「一趟打包」。
+        Journal journal = new FileJournal(journalDir);
+        journal.append(new JournalEvent.RunStarted(tenant, runId, task));
+        journal.append(new JournalEvent.StepPlanned(tenant, new StepId(runId.value(), 0),
+                "t-a", "send_message", "sha256:" + "a".repeat(64), false));
+        journal.append(new JournalEvent.StepDispatched(tenant, new StepId(runId.value(), 0), "t-a", 1));
+        journal.append(new JournalEvent.StepPlanned(tenant, new StepId(runId.value(), 1),
+                "t-b", "send_message", "sha256:" + "b".repeat(64), false));
+        journal.append(new JournalEvent.StepDispatched(tenant, new StepId(runId.value(), 1), "t-b", 1));
+
+        // 恢复一：两个非幂等悬空步都无收据 → 一次挂起两步全带上，StepResolution 一次落满；
+        // containsExactly 按 seq 锁死顺序——顺序若随 hash 漂移，这条断言就会 flaky
+        UncertainStepException suspended = catchThrowableOfType(() ->
+                new AgentLoop(tenant, tools, new TwoSendModel(), journal, receipts).run(runId, task),
+                UncertainStepException.class);
+        assertThat(suspended.steps()).extracting(Uncertain::toolUseId).containsExactly("t-a", "t-b");
+        assertThat(suspended.getMessage()).contains("结果未知且无收据").contains("共 2 步").contains("人工介入");
+        assertThat(send.count.get()).isZero();
+        assertThat(awaitingHuman(new FileJournal(journalDir), tenant, runId))
+                .extracting(JournalEvent.StepResolution::toolUseId).containsExactly("t-a", "t-b");
+
+        // 恢复二（人工还没动）：重抛同一场挂起、不堆第二条裁定
+        UncertainStepException again = catchThrowableOfType(() ->
+                new AgentLoop(tenant, tools, new TwoSendModel(), new FileJournal(journalDir), receipts)
+                        .run(runId, task),
+                UncertainStepException.class);
+        assertThat(again.getMessage()).isEqualTo(suspended.getMessage());
+        assertThat(awaitingHuman(new FileJournal(journalDir), tenant, runId)).hasSize(2);
+
+        // 人工一趟：两个收据一次补齐 → 一次恢复全部回放、run 收尾，全程零真实副作用
+        receipts.trySaveIfAbsent(new IdempotencyKey(tenant, runId, "t-a"),
+                new Receipt("ok-a(人工确认已发出)", false));
+        receipts.trySaveIfAbsent(new IdempotencyKey(tenant, runId, "t-b"),
+                new Receipt("ok-b(人工确认已发出)", false));
+        String answer = new AgentLoop(tenant, tools, new TwoSendModel(), new FileJournal(journalDir), receipts)
+                .run(runId, task);
+
+        assertThat(answer).isEqualTo("两条消息都已发出，run 结束。");
+        assertThat(send.count.get()).isZero();
+        assertThat(mailbox.deliveredCount()).isZero();
+        List<JournalEvent> events = new FileJournal(journalDir).scan(tenant, runId, -1L);
+        assertThat(events.stream()
+                .filter(JournalEvent.StepDone.class::isInstance)
+                .map(JournalEvent.StepDone.class::cast)
+                .filter(ev -> "replayed_from_receipt".equals(ev.source()))
+                .map(JournalEvent.StepDone::toolUseId)
+                .toList()).containsExactly("t-a", "t-b");
+        assertThat(events.stream().filter(JournalEvent.RunFinished.class::isInstance)).hasSize(1);
+        assertThat(awaitingHuman(new FileJournal(journalDir), tenant, runId)).hasSize(2);
+    }
+
+    @Test
     void 外层幂等键_下游自己去重_不依赖平台幂等层() {
         // 注册期把关：有副作用又不认外层键的工具，根本进不了工具表
         assertThatThrownBy(() -> new ToolRouter(new WebSearchTool(), new NoKeySendTool()))
@@ -376,6 +447,15 @@ class M1Test {
         }
         Files.createDirectories(dir);
         return dir;
+    }
+
+    /** journal 里的 awaiting_human 裁定（按事件顺序）——「一次落满」「不堆第二条」都靠它数。 */
+    private static List<JournalEvent.StepResolution> awaitingHuman(Journal journal, TenantId tenant, RunId runId) {
+        return journal.scan(tenant, runId, -1L).stream()
+                .filter(JournalEvent.StepResolution.class::isInstance)
+                .map(JournalEvent.StepResolution.class::cast)
+                .filter(ev -> "awaiting_human".equals(ev.resolution()))
+                .toList();
     }
 
     /** 计数替身：包住真实 SendMessageTool，数副作用真实发生了几次。 */
@@ -485,6 +565,25 @@ class M1Test {
             count.incrementAndGet();
             new WebSearchTool().invoke(use);
             throw new RuntimeException("模拟崩溃: 下游持续故障");
+        }
+    }
+
+    /** 两连发模型替身：t-a、t-b 两个结果都进了轨迹才终答——多悬空步场景的驱动，与桩模型的「搜索+发送」无关。 */
+    static final class TwoSendModel implements ModelGateway {
+
+        @Override
+        public ModelResponse sample(StepCtx ctx, List<Msg> messages) {
+            boolean sentA = messages.stream().anyMatch(m -> "t-a".equals(m.toolUseId()));
+            boolean sentB = messages.stream().anyMatch(m -> "t-b".equals(m.toolUseId()));
+            if (!sentA) {
+                return new ModelResponse("先发 a。", List.of(new ToolUse("t-a", "send_message",
+                        "{\"to\":\"ops\",\"campaign\":\"pack\",\"seq\":1,\"msg\":\"a\"}")));
+            }
+            if (!sentB) {
+                return new ModelResponse("再发 b。", List.of(new ToolUse("t-b", "send_message",
+                        "{\"to\":\"ops\",\"campaign\":\"pack\",\"seq\":2,\"msg\":\"b\"}")));
+            }
+            return ModelResponse.of("两条消息都已发出，run 结束。");
         }
     }
 
